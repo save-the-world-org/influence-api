@@ -105,10 +105,20 @@ function resolveInfluencer(q) {
   return best
 }
 
+// A beacon's ID is the 8 hex digits of its DEVICEADDR[0], found inside the name it advertises:
+// "Hero Finder (86E7C53A)" and "DWM3001CDK (86E7C53A)" are both 86E7C53A.
+const hexId = (s) => (String(s || '').match(/(?:^|[^0-9A-Fa-f])([0-9A-Fa-f]{8})(?![0-9A-Fa-f])/) || [])[1]?.toUpperCase() || null
+
 function resolveBeacon(q) {
   if (!q) return null
   const key = String(q).trim()
-  return state.beacons.get(slug(key)) || [...state.beacons.values()].find((b) => b.hardwareId && b.hardwareId === key) || null
+  const hex = hexId(key)
+  return (
+    state.beacons.get(slug(key)) ||
+    [...state.beacons.values()].find((b) => b.hardwareId && b.hardwareId === key) ||
+    (hex && [...state.beacons.values()].find((b) => hexId(b.hardwareId) === hex)) ||
+    null
+  )
 }
 
 const beaconOf = (influencerId) => [...state.beacons.values()].find((b) => b.influencerId === influencerId) || null
