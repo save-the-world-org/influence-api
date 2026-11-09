@@ -3,8 +3,10 @@
 // No dependencies: Node 22's http, crypto and fetch.
 import http from 'node:http'
 import { createHmac, randomBytes } from 'node:crypto'
+import { readFileSync } from 'node:fs'
 
-const VERSION = process.env.npm_package_version || '0.1.0'
+// The launcher runs node directly, so npm's package variables are not set: read the version from package.json.
+const VERSION = JSON.parse(readFileSync(new URL('./package.json', import.meta.url), 'utf8')).version
 const PORT = Number(process.env.PORT || 8080)
 // Registry writes (influencers, beacons) need this key when it is set: header `Authorization: Bearer <key>`.
 // Readings, the seek target, search and reads stay open so the phone, the glasses and the map need no key.
@@ -504,12 +506,13 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-// The two influencers the hackathon starts with. Each sets their own name, photo and how they show.
-upsertInfluencer({ id: 'kelsey', name: 'Kelsey', tagline: 'Find me at KubeCon', color: '#3DA992' })
-upsertInfluencer({ id: 'kunal', name: 'Kunal', tagline: 'Find me at KubeCon', color: '#8B7CF6' })
-upsertBeacon({ id: 'beacon-1', name: 'Beacon 1', influencerId: 'kelsey' })
-upsertBeacon({ id: 'beacon-2', name: 'Beacon 2', influencerId: 'kunal' })
+// The registry Elasticsearch kept, then the two influencers the hackathon starts with, only where it has none: a
+// restart must not undo what an influencer set on their own page.
 await esLoad()
+if (!state.influencers.has('kelsey')) upsertInfluencer({ id: 'kelsey', name: 'Kelsey', tagline: 'Find me at KubeCon', color: '#3DA992' })
+if (!state.influencers.has('kunal')) upsertInfluencer({ id: 'kunal', name: 'Kunal', tagline: 'Find me at KubeCon', color: '#8B7CF6' })
+if (!state.beacons.has('beacon-1')) upsertBeacon({ id: 'beacon-1', name: 'Beacon 1', influencerId: 'kelsey' })
+if (!state.beacons.has('beacon-2')) upsertBeacon({ id: 'beacon-2', name: 'Beacon 2', influencerId: 'kunal' })
 
 server.listen(PORT, () => console.log(`influence-api ${VERSION} on :${PORT}${ES_URL ? `, Elasticsearch at ${ES_URL}` : ''}`))
 for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => server.close(() => process.exit(0)))
