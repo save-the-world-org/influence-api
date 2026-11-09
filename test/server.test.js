@@ -53,9 +53,9 @@ async function fakeElasticsearch() {
   }
 }
 
-// One server process, against Elasticsearch at esUrl or with none: resolves once it listens.
-async function startServer(esUrl) {
-  const env = { PATH: process.env.PATH, PORT: '0', ...(esUrl ? { ES_URL: esUrl } : {}) }
+// One server process, against Elasticsearch at esUrl or with none, with any more env: resolves once it listens.
+async function startServer(esUrl, more = {}) {
+  const env = { PATH: process.env.PATH, PORT: '0', ...(esUrl ? { ES_URL: esUrl } : {}), ...more }
   const child = spawn(process.execPath, [SERVER], { env, stdio: ['ignore', 'pipe', 'pipe'] })
   let log = ''
   child.stderr.on('data', (c) => (log += c))
@@ -74,6 +74,18 @@ async function startServer(esUrl) {
     get: (path) => fetch(base + path).then((r) => r.json()),
     call: (method, path, body) =>
       fetch(base + path, { method, headers: { 'content-type': 'application/json' }, body: body && JSON.stringify(body) }).then(async (r) => ({ status: r.status, body: await r.json() })),
+    // The event stream as text, as it arrives, until close().
+    stream: (path) => {
+      const ac = new AbortController()
+      let text = ''
+      fetch(base + path, { signal: ac.signal })
+        .then(async (r) => {
+          const dec = new TextDecoder()
+          for await (const c of r.body) text += dec.decode(c, { stream: true })
+        })
+        .catch(() => {})
+      return { text: () => text, close: () => ac.abort() }
+    },
     // SIGTERM, as a deploy sends it; SIGKILL if it has not gone in two seconds.
     stop: () =>
       new Promise((r) => {
@@ -133,7 +145,7 @@ test('a cleared target stays gone, even cleared at once after it was set', async
 
   const second = await startServer(es.url)
   t.after(() => second.stop())
-  assert.deepEqual(await second.get('/api/target?seeker=phone'), { seekerId: 'phone', target: null })
+  assert.deepEqual(await second.get('/api/target?seeker=phone'), { seekerId: 'phone', target: null, alert: null })
   assert.deepEqual((await second.get('/api/state')).targets, [])
 })
 
@@ -185,4 +197,139 @@ test('with Elasticsearch unreachable the API starts anyway, says so, and a targe
   assert.match(server.log(), /elasticsearch not reachable, the seek targets start empty/)
   assert.equal((await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })).status, 200)
   assert.equal((await server.get('/api/target?seeker=phone')).name, 'Kunal')
+})
+
+// ---------- distance alerts ----------
+
+const M = (ft) => ft / 3.28084 // feet, as the metres the phone sends
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+// The phone's readings of Kunal's beacon, `gap` ms apart.
+async function walk(server, metres, gap) {
+  for (const distance of metres) {
+    assert.equal((await server.call('POST', '/api/readings', { seekerId: 'phone', hardwareId: 'CA588E78', distance })).status, 201)
+    await sleep(gap)
+  }
+}
+
+test('walking up to Kunal fires closer at 30, 20, 10 and 5 ft, then found: on the list, the stream, the target and in Elasticsearch', async (t) => {
+  const es = await fakeElasticsearch()
+  t.after(() => es.close())
+  const server = await startServer(es.url, { ALERT_GAP_MS: '50' })
+  t.after(() => server.stop())
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  const stream = server.stream('/api/events')
+  t.after(() => stream.close())
+  await until('the stream open', () => stream.text().includes('event: state'))
+
+  await walk(server, [15, 9, 5.9, 2.9, 1.4, 0.8], 120)
+  const list = await server.get('/api/alerts?seeker=phone&limit=20')
+  const oldestFirst = [...list].reverse()
+  assert.deepEqual(oldestFirst.map((a) => `${a.kind} ${a.feet}`), ['closer 30', 'closer 20', 'closer 10', 'closer 5', 'found 3'])
+  assert.deepEqual(oldestFirst.map((a) => a.message), ['Kunal within 30 ft', 'Kunal within 20 ft', 'Kunal within 10 ft', 'Kunal within 5 ft', 'Found Kunal'])
+  assert.deepEqual(oldestFirst.map((a) => a.distanceFt), [29.5, 19.4, 9.5, 4.6, 2.6])
+  const found = list[0]
+  assert.deepEqual(Object.keys(found).sort(), ['at', 'beaconId', 'distanceFt', 'feet', 'id', 'influencerId', 'kind', 'message', 'name', 'seekerId'])
+  assert.deepEqual([found.seekerId, found.influencerId, found.name, found.beaconId], ['phone', 'kunal', 'Kunal', 'beacon-2'])
+  assert.match(found.id, /^phone-\d+$/)
+  assert.equal(new Set(list.map((a) => a.id)).size, 5)
+  assert.ok(Date.now() - Date.parse(found.at) < 5000)
+  assert.equal((await server.get('/api/alerts?limit=2')).length, 2)
+  assert.equal((await server.get('/api/alerts')).length, 5)
+  assert.deepEqual(await server.get('/api/alerts?seeker=someone-else'), [])
+
+  // The glasses' poll, the stream and Elasticsearch.
+  assert.deepEqual((await server.get('/api/target?seeker=phone')).alert, found)
+  await until('the alert on the stream', () => stream.text().includes(`event: alert\ndata: ${JSON.stringify(found)}\n\n`))
+  stream.close()
+  await until('the alert in alerts-influence', () => es.doc('alerts-influence', found.id))
+  assert.deepEqual(es.doc('alerts-influence', found.id), found)
+
+  // A new target starts over: no alert carried, and found fires again.
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  assert.equal((await server.get('/api/target?seeker=phone')).alert, null)
+  await walk(server, [0.8], 0)
+  assert.equal((await server.get('/api/target?seeker=phone')).alert.message, 'Found Kunal')
+})
+
+test('jitter on a line fires once: 9.9, 10.2, 9.8, 10.2 and 9.9 ft', async (t) => {
+  const server = await startServer(null, { ALERT_GAP_MS: '50' }) // a short gap: the band, not the gap, holds it to one
+  t.after(() => server.stop())
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  await walk(server, [M(13), M(9.9), M(10.2), M(9.8), M(10.2), M(9.9)], 120)
+  assert.deepEqual((await server.get('/api/alerts?seeker=phone')).map((a) => a.message), ['Kunal within 10 ft'])
+})
+
+test('two crossings within 4 s give one alert; the latest waits for the 4 s to be up', async (t) => {
+  const server = await startServer(null) // the real 4 s gap
+  t.after(() => server.stop())
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  await walk(server, [M(25), M(19), M(15), M(9)], 50) // crosses 20, then 10, inside 4 s
+  assert.deepEqual((await server.get('/api/alerts?seeker=phone')).map((a) => a.message), ['Kunal within 20 ft'])
+  await sleep(3000)
+  assert.equal((await server.get('/api/alerts?seeker=phone')).length, 1)
+  await sleep(1200)
+  const [latest, first] = await server.get('/api/alerts?seeker=phone')
+  assert.equal(latest.message, 'Kunal within 10 ft')
+  assert.ok(Date.parse(latest.at) - Date.parse(first.at) >= 3990, `${first.at} then ${latest.at}`)
+})
+
+test('lost fires once, LOST_MS after the last reading, and only once there were readings', async (t) => {
+  const server = await startServer(null, { LOST_MS: '300', ALERT_GAP_MS: '50' })
+  t.after(() => server.stop())
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  await sleep(600)
+  assert.deepEqual(await server.get('/api/alerts?seeker=phone'), [])
+  await walk(server, [6], 150)
+  assert.deepEqual(await server.get('/api/alerts?seeker=phone'), [])
+  await sleep(400)
+  const lost = await server.get('/api/alerts?seeker=phone')
+  assert.deepEqual(lost.map((a) => [a.kind, a.feet, a.distanceFt, a.message]), [['lost', null, 19.7, 'Lost Kunal']])
+  await sleep(600)
+  assert.equal((await server.get('/api/alerts?seeker=phone')).length, 1)
+})
+
+// ---------- integrations ----------
+
+test('integrations show what is on by host only, never a key or a header, and the last alert', async (t) => {
+  const es = await fakeElasticsearch()
+  t.after(() => es.close())
+  const server = await startServer(es.url, {
+    ES_AUTH: 'ApiKey c2VjcmV0LWVzLWtleQ==',
+    OTEL_EXPORTER_OTLP_ENDPOINT: 'https://ingress.us-west-2.aws.dash0.com',
+    OTEL_EXPORTER_OTLP_HEADERS: 'Authorization=Bearer auth_not_for_the_page',
+    WRITE_KEY: 'write-key-not-for-the-page',
+    ALERT_GAP_MS: '50',
+  })
+  t.after(() => server.stop())
+  const before = await server.get('/api/integrations')
+  assert.deepEqual(before, {
+    elasticsearch: { on: true, url: '127.0.0.1' },
+    telemetry: { on: true, endpoint: 'ingress.us-west-2.aws.dash0.com' },
+    radar: { lastSeen: null, mirrored: 0, lastEvent: null },
+    alerts: { count: 0, last: null },
+  })
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  await walk(server, [M(13), M(9)], 0)
+  const after = await server.get('/api/integrations')
+  assert.equal(after.alerts.count, 1)
+  assert.equal(after.alerts.last.message, 'Kunal within 10 ft')
+  const raw = JSON.stringify(after)
+  for (const secret of ['c2VjcmV0', 'auth_not_for_the_page', 'write-key-not-for-the-page', 'Authorization']) assert.ok(!raw.includes(secret), secret)
+
+  const bare = await startServer(null)
+  t.after(() => bare.stop())
+  const off = await bare.get('/api/integrations')
+  assert.deepEqual([off.elasticsearch, off.telemetry], [{ on: false, url: null }, { on: false, endpoint: null }])
+})
+
+test('the Radar bridge heartbeat is open and sets lastSeen, the count and the last Event', async (t) => {
+  const server = await startServer(null, { WRITE_KEY: 'a-write-key' })
+  t.after(() => server.stop())
+  const before = Date.now()
+  const beat = await server.call('POST', '/api/integrations/radar', { mirrored: 3, lastEvent: 'HeroFound: Found Kunal (seeker phone)' })
+  assert.equal(beat.status, 200) // no key needed, like readings
+  const { radar } = await server.get('/api/integrations')
+  assert.equal(radar.mirrored, 3)
+  assert.equal(radar.lastEvent, 'HeroFound: Found Kunal (seeker phone)')
+  assert.ok(Date.parse(radar.lastSeen) >= before - 1000 && Date.parse(radar.lastSeen) <= Date.now())
 })
