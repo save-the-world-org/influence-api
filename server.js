@@ -175,7 +175,7 @@ function addReading(input) {
     trend: str(input.trend, 20),
     at: now(),
   }
-  r.hardwareId = beacon.hardwareId || null
+  r.hardwareId = hexId(beacon.hardwareId) || beacon.hardwareId || null
   r.estimate = estimate({ ...r, lat: input.lat, lon: input.lon }, seeker)
   state.readings.set(beacon.id, r)
   state.seekerReadings.set(`${seekerId}|${beacon.id}`, r)
@@ -222,7 +222,10 @@ function describeTarget(t) {
   return {
     ...t,
     name: inf?.name || beacon?.name || null,
-    hardwareId: beacon?.hardwareId || null,
+    // The beacon's ID, the 8 hex digits of DEVICEADDR[0] the phone finds in the advertised name; the name as
+    // registered stays in hardwareName.
+    hardwareId: hexId(beacon?.hardwareId) || beacon?.hardwareId || null,
+    hardwareName: beacon?.hardwareId || null,
     // This seeker's own latest reading of the beacon, never another seeker's.
     lastReading: beacon ? state.seekerReadings.get(`${t.seekerId}|${beacon.id}`) || null : null,
     note: beacon ? null : `${inf?.name} has no beacon yet: map one in the registry`,
