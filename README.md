@@ -1,6 +1,6 @@
 # influence-api
 
-The API behind [Influence](https://influence.darkshift.cloud), by Darkshift: the beacon and influencer registry,
+The API behind [Hero Goggles](https://hero-goggles.darkshift.cloud) (formerly Influence), by Darkshift: the beacon and influencer registry,
 live readings from the phone, the seek target ("find Kunal"), a live event stream for the map, and the same actions
 as MCP tools. One file, `server.js`, no dependencies (Node 22). Infrared builds it with Paketo buildpacks and runs
 `npm start`.
