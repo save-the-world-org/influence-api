@@ -362,6 +362,7 @@ function fire(seekerId, a, { kind, feet, ft }) {
     distanceFt: ft == null ? null : Math.round(ft * 10) / 10,
     at: now(),
     message: { closer: `${name} within ${feet} ft`, found: `Found ${name}`, farther: `${name} moving away, ${feet} ft`, lost: `Lost ${name}` }[kind],
+    source: 'api', // 'radar' once the bridge reads its Event back from Skyhook Radar: POST /api/radar/alerts
   }
   a.lastKey = key
   a.lastAt = Date.now()
@@ -374,10 +375,35 @@ function fire(seekerId, a, { kind, feet, ft }) {
   for (const res of clients) res.write(data)
 }
 
-// The seeker's latest alert while it is fresh, for the glasses' poll of GET /api/target.
+// The seeker's latest alert while it is fresh, for the glasses' poll of GET /api/target. While the Radar bridge's
+// heartbeat is fresh, only alerts Radar confirmed count, fresh for ALERT_FRESH_MS from their confirmation; with the
+// heartbeat over RADAR_STALE_MS old, the API's own latest alert, so the lens never goes dark.
 function recentAlert(seekerId) {
-  const latest = alerting.get(seekerId)?.latest
-  return latest && Date.now() - Date.parse(latest.at) <= ALERT_FRESH_MS ? latest : null
+  const a = alerting.get(seekerId)
+  if (radarLive()) return a?.radarLatest && Date.now() - Date.parse(a.radarLatest.radarAt) <= ALERT_FRESH_MS ? a.radarLatest : null
+  return a?.latest && Date.now() - Date.parse(a.latest.at) <= ALERT_FRESH_MS ? a.latest : null
+}
+
+// The bridge read an alert's Event back from Skyhook Radar: the alert (same id) is Radar's from now on, goes to the
+// stream again and to Elasticsearch. Confirming one twice changes nothing. Unknown ids are a 404.
+function confirmAlert(body) {
+  const alertId = str(body.alertId, 120)
+  const alert = alertId && alerts.findLast((x) => x.id === alertId)
+  if (!alert) throw httpError(404, `no alert ${alertId || '(no alertId)'}`)
+  if (alert.source === 'radar') return alert
+  alert.source = 'radar'
+  alert.radarAt = now()
+  alert.radarReason = body.reason ? str(body.reason, 40) : null
+  alert.radarEventId = body.radarEventId ? str(body.radarEventId, 253) : null
+  const a = alerting.get(alert.seekerId)
+  if (a && (!a.radarLatest || Date.parse(alert.at) >= Date.parse(a.radarLatest.at))) a.radarLatest = alert
+  radar.confirmed += 1
+  radar.lastConfirmedAt = alert.radarAt
+  radar.latencyMs = Date.parse(alert.radarAt) - Date.parse(alert.at)
+  esPut(ALERTS_INDEX, alert.id, alert)
+  const data = `event: alert\ndata: ${JSON.stringify(alert)}\n\n`
+  for (const res of clients) res.write(data)
+  return alert
 }
 
 function listAlerts(seekerId, limit) {
@@ -396,8 +422,11 @@ const hostOf = (u) => {
   }
 }
 const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || ''
-// The Radar bridge's heartbeat (deploy/radar-bridge): how many Events it made, and the last one.
-const radar = { lastSeen: null, mirrored: 0, lastEvent: null }
+// The Radar bridge's heartbeat (deploy/radar-bridge): how many Events it made, and the last one; how many alerts Radar
+// confirmed, the last confirmation, and its latency (radarAt - at).
+const RADAR_STALE_MS = Number(process.env.RADAR_STALE_MS || 15000)
+const radar = { lastSeen: null, mirrored: 0, lastEvent: null, confirmed: 0, lastConfirmedAt: null, latencyMs: null }
+const radarLive = () => !!radar.lastSeen && Date.now() - Date.parse(radar.lastSeen) <= RADAR_STALE_MS
 function integrations() {
   return {
     elasticsearch: { on: !!ES_URL, url: hostOf(ES_URL) },
@@ -713,14 +742,18 @@ const server = http.createServer(async (req, res) => {
       return send(res, 200, listAlerts(seeker ? slug(seeker) : null, limit))
     }
     if (kind === 'integrations' && !id && req.method === 'GET') return send(res, 200, integrations())
-    // The Radar bridge's heartbeat, open like readings: {mirrored, lastEvent}.
+    // The Radar bridge's heartbeat, open like readings: {mirrored, confirmed, lastEvent}.
     if (kind === 'integrations' && id === 'radar' && req.method === 'POST') {
       const body = await readBody(req)
       radar.mirrored = Math.max(0, Math.floor(num(body.mirrored) ?? 0))
+      radar.confirmed = Math.max(radar.confirmed, Math.floor(num(body.confirmed) ?? 0))
       radar.lastEvent = body.lastEvent ? str(body.lastEvent, 300) : null
       radar.lastSeen = now()
       return send(res, 200, radar)
     }
+    // An alert's Event, read back from Skyhook Radar by the bridge, open like readings:
+    // {alertId, radarEventId, reason, message, at, seekerId}.
+    if (kind === 'radar' && id === 'alerts' && req.method === 'POST') return send(res, 200, confirmAlert(await readBody(req)))
     if (kind === 'target') {
       const seeker = u.searchParams.get('seeker') || 'phone'
       if (req.method === 'GET') return send(res, 200, { ...(describeTarget(state.targets.get(slug(seeker))) || { seekerId: slug(seeker), target: null }), alert: recentAlert(slug(seeker)) })
