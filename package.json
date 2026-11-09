@@ -1,6 +1,6 @@
 {
   "name": "influence-api",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "private": true,
   "type": "module",
   "description": "Influence's API: the beacon and influencer registry, live readings, the seek target and MCP tools",
