@@ -23,3 +23,11 @@ as MCP tools. One file, `server.js`, no dependencies (Node 22). Infrared builds 
 
 Settings, all optional: `WRITE_KEY` (registry writes need `Authorization: Bearer <key>` when set), `PROFILE_SECRET`
 (derives each influencer's profile key), `ES_URL` and `ES_AUTH` (Elasticsearch).
+
+## Keys
+
+`scripts/set-keys.sh` sets `WRITE_KEY` and `PROFILE_SECRET` on the zone as secret env through Infrared's API, with the
+token `ir` saved for google-cp-saas-v1, and prints neither. Only `WRITE_KEY` goes to the clipboard, for 1Password and for
+the registry page. Running it again rotates both. The API restarts once with the new values, and each influencer's
+profile link changes, so share the links again. The workspace's `accounts/infrared-google-cp-saas-v1.yaml` records both
+and when they are due.
