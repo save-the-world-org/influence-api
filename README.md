@@ -17,6 +17,7 @@ as MCP tools. One file, `server.js`, no dependencies (Node 22). Infrared builds 
 | `GET, POST /api/beacons`, `PUT, DELETE /api/beacons/:id` | beacons, each mapped to an influencer or to nobody (`influencerId: null`) |
 | `POST /api/readings` | from the phone: `{seekerId, beaconId or hardwareId, distance, azimuthDeg, heading, lat, lon}` |
 | `POST /api/seekers/:id` | a phone's GPS position and compass heading |
+| `POST, GET /api/seekers/:id/frame` | the glasses' camera, relayed by the phone: POST a JPEG (at most 400 KB, open like readings, 204); GET the latest back with the write key (`x-frame-at`), 404 once it is over 30 s old. Memory only, the latest per seeker; the stream says `event: frame` `{seekerId, at}` at most twice a second, and each seeker in `/api/state` carries `frameAt` |
 | `GET, PUT, DELETE /api/target?seeker=phone` | who the phone seeks: `PUT {"name": "Kunal"}`; the GET carries `alert`, the seeker's latest alert from the last 8 s, or `null` |
 | `GET /api/alerts?seeker=phone&limit=20` | distance alerts, newest first, of one seeker or all (the last 200, in memory) |
 | `GET /api/integrations` | what `/live/` shows: Elasticsearch, telemetry (hosts only, never a key or header), the Radar bridge's heartbeat, the alert count and the last alert |

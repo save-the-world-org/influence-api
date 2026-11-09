@@ -70,6 +70,7 @@ async function startServer(esUrl, more = {}) {
   })
   const base = `http://127.0.0.1:${port}`
   return {
+    base,
     log: () => log,
     get: (path) => fetch(base + path).then((r) => r.json()),
     call: (method, path, body) =>
@@ -403,4 +404,67 @@ test('confirming an unknown alert answers 404', async (t) => {
   assert.match(res.body.error, /no alert phone-1/)
   assert.equal((await server.call('POST', '/api/radar/alerts', {})).status, 404)
   assert.equal((await server.get('/api/integrations')).radar.confirmed, 0)
+})
+
+// ---------- camera frames ----------
+
+const jpeg = (n) => Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(n - 4, 7)])
+const postFrame = (server, buf) => fetch(`${server.base}/api/seekers/phone/frame`, { method: 'POST', headers: { 'content-type': 'image/jpeg' }, body: buf })
+const getFrame = (server, key) => fetch(`${server.base}/api/seekers/phone/frame`, { headers: key ? { authorization: `Bearer ${key}` } : {} })
+const HERE = { lat: 40.767437, lon: -111.8962966 }
+
+test('a camera frame reads back byte for byte with the write key, on the stream and in state, never in Elasticsearch', async (t) => {
+  const es = await fakeElasticsearch()
+  t.after(() => es.close())
+  const server = await startServer(es.url, { WRITE_KEY: 'a-write-key' })
+  t.after(() => server.stop())
+  const stream = server.stream('/api/events')
+  t.after(() => stream.close())
+  await until('the stream open', () => stream.text().includes('event: state'))
+  await server.call('POST', '/api/seekers/phone', HERE)
+  const frame = jpeg(120 * 1024)
+  assert.equal((await postFrame(server, frame)).status, 204) // no key needed, like readings
+
+  assert.equal((await getFrame(server)).status, 401)
+  assert.equal((await getFrame(server, 'not-the-key')).status, 401)
+  const res = await getFrame(server, 'a-write-key')
+  assert.equal(res.status, 200)
+  assert.equal(res.headers.get('content-type'), 'image/jpeg')
+  assert.equal(res.headers.get('cache-control'), 'no-store')
+  assert.match(res.headers.get('access-control-expose-headers'), /x-frame-at/)
+  const at = res.headers.get('x-frame-at')
+  assert.ok(Date.now() - Date.parse(at) < 5000, at)
+  assert.ok(Buffer.from(await res.arrayBuffer()).equals(frame))
+
+  await until('the frame on the stream', () => stream.text().includes(`event: frame\ndata: ${JSON.stringify({ seekerId: 'phone', at })}\n\n`))
+  assert.equal((await server.get('/api/state')).seekers.find((s) => s.id === 'phone').frameAt, at)
+  // Three more inside half a second: one more event at most, naming the latest.
+  for (let i = 0; i < 3; i++) assert.equal((await postFrame(server, jpeg(1024 + i))).status, 204)
+  await sleep(700)
+  const events = stream.text().split('\n\n').filter((m) => m.startsWith('event: frame'))
+  assert.equal(events.length, 2)
+  const latest = await getFrame(server, 'a-write-key')
+  assert.equal(JSON.parse(events[1].split('data: ')[1]).at, latest.headers.get('x-frame-at'))
+  assert.equal((await latest.arrayBuffer()).byteLength, 1026)
+  assert.ok(es.writes.every((w) => !w.includes('frame')), es.writes.join(', '))
+})
+
+test('a frame over 400 KB is a 413 and keeps nothing; 400 KB is fine', async (t) => {
+  const server = await startServer(null)
+  t.after(() => server.stop())
+  assert.equal((await postFrame(server, jpeg(400 * 1024 + 1))).status, 413)
+  assert.equal((await getFrame(server)).status, 404)
+  assert.equal((await postFrame(server, jpeg(400 * 1024))).status, 204)
+  assert.equal((await getFrame(server)).status, 200) // no WRITE_KEY set: reading needs none
+})
+
+test('a frame older than FRAME_FRESH_MS counts as none: a 404, and frameAt null', async (t) => {
+  const server = await startServer(null, { WRITE_KEY: 'a-write-key', FRAME_FRESH_MS: '300' })
+  t.after(() => server.stop())
+  await server.call('POST', '/api/seekers/phone', HERE)
+  assert.equal((await postFrame(server, jpeg(2048))).status, 204)
+  assert.equal((await getFrame(server, 'a-write-key')).status, 200)
+  await sleep(450)
+  assert.equal((await getFrame(server, 'a-write-key')).status, 404)
+  assert.equal((await server.get('/api/state')).seekers.find((s) => s.id === 'phone').frameAt, null)
 })
