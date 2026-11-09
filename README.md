@@ -6,6 +6,7 @@ as MCP tools. One file, `server.js`, no dependencies (Node 22). Infrared builds 
 `npm start`.
 
     npm start            # http://localhost:8080
+    npm test             # node --test: server.js as real processes, restarted against a fake Elasticsearch, and with none
 
 | Route | What |
 |---|---|
@@ -23,6 +24,24 @@ as MCP tools. One file, `server.js`, no dependencies (Node 22). Infrared builds 
 
 Settings, all optional: `WRITE_KEY` (registry writes need `Authorization: Bearer <key>` when set), `PROFILE_SECRET`
 (derives each influencer's profile key), `ES_URL` and `ES_AUTH` (Elasticsearch).
+
+## State
+
+With `ES_URL` set, what the map and the phone need survives a deploy or a restart:
+
+- **The registry**, influencers and beacons, in the indices `influence-influencers` and `influence-beacons`: written on
+  every change, loaded at start.
+- **The seek targets**, who each seeker is finding, in `seek-targets`, one document per seeker id: written when set,
+  deleted when cleared, loaded at start after the registry. The index sits outside the `influence-*` and `kubecon-*`
+  patterns search runs over, so a target never shows up as a result.
+- **The seed**, `registry.seed.json` in git: the hackathon's influencers and beacons (registry fields only, never a
+  key). At start it fills only those Elasticsearch does not have, so a restart never undoes an influencer's own edits.
+
+Writes to one document go out in the order they were made, and a SIGTERM waits for those still on their way. A write
+that fails is logged and never fails the request; with Elasticsearch unreachable at start, the API starts on the seed
+and says so. Readings and each seeker's position stay in memory only: the phone sends readings twice a second, so fresh
+ones arrive within a second of a restart. Without `ES_URL` everything lives in memory, and a restart starts from the
+seed.
 
 ## Keys
 
