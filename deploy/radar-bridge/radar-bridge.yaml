@@ -200,7 +200,7 @@ data:
       } catch (e) {
         log('heartbeat', e)
       }
-      setTimeout(tick, 2000)
+      setTimeout(tick, Number(process.env.POLL_MS || 500))
     }
 
     console.log(`radar-bridge: alerts from ${API} to Events on deployment/influence-api in ${NAMESPACE}, read back from Radar at ${RADAR}`)
