@@ -31,3 +31,11 @@ token `ir` saved for google-cp-saas-v1, and prints neither. Only `WRITE_KEY` goe
 the registry page. Running it again rotates both. The API restarts once with the new values, and each influencer's
 profile link changes, so share the links again. The workspace's `accounts/infrared-google-cp-saas-v1.yaml` records both
 and when they are due.
+
+## Telemetry
+
+`telemetry.mjs` loads OpenTelemetry's Node auto-instrumentation before the server when `OTEL_EXPORTER_OTLP_ENDPOINT` is
+set: every request becomes a trace, with HTTP metrics, sent over OTLP. On google-cp-saas-v1 the zone sends to Dash0
+(region us-west-2, dataset `default`): plain env `OTEL_SERVICE_NAME`, `OTEL_EXPORTER_OTLP_ENDPOINT`,
+`OTEL_EXPORTER_OTLP_PROTOCOL` and the exporters, and the token in the secret `OTEL_EXPORTER_OTLP_HEADERS`, never in git.
+Without the endpoint nothing is loaded.
