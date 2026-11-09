@@ -179,6 +179,7 @@ function addReading(input) {
   r.estimate = estimate({ ...r, lat: input.lat, lon: input.lon }, seeker)
   state.readings.set(beacon.id, r)
   state.seekerReadings.set(`${seekerId}|${beacon.id}`, r)
+  checkDistance(seekerId, beacon.id, r.distance)
   changed()
   return r
 }
@@ -201,6 +202,8 @@ function setSeeker(id, input, { quiet } = {}) {
 
 function setTarget(seekerId, who) {
   const sid = slug(seekerId || 'phone') || 'phone'
+  // A new target, or none, starts the seeker's alerts over.
+  resetAlerts(sid)
   if (!who) {
     state.targets.delete(sid)
     esDelete(TARGETS_INDEX, sid)
@@ -260,6 +263,149 @@ function changed() {
 setInterval(() => {
   for (const res of clients) res.write(': keep-alive\n\n')
 }, 15000).unref()
+
+// ---------- distance alerts ----------
+
+// Per seeker, and only for readings of that seeker's target's beacon: closer below 50, 30, 20, 10 and 5 ft, found at
+// 3 ft or less (again only after more than 8 ft), farther above 10, 20 and 30 ft, lost after LOST_MS with no reading.
+// Each line has a 1.5 ft band: below it is inside, 1.5 ft or more above it is outside, and only a move from one side
+// to the other fires, so jitter on a line fires once. At most one alert per seeker every ALERT_GAP_MS: a crossing
+// inside the gap is held, the latest held one wins and goes out when the gap is up, and never the same kind and line
+// twice in a row. A new target starts the seeker over. The last 200 stay in memory; each goes to the stream as
+// `event: alert` and to Elasticsearch's alerts-influence, outside the patterns search runs over.
+const FT_PER_M = 3.28084
+const BAND_FT = 1.5
+const LINES_FT = [50, 30, 20, 10, 5] // closer fires at each
+const FARTHER_FT = [10, 20, 30]
+const FOUND_FT = 3
+const FOUND_REARM_FT = 8
+const ALERT_GAP_MS = Number(process.env.ALERT_GAP_MS || 4000)
+const LOST_MS = Number(process.env.LOST_MS || 10000)
+const ALERT_FRESH_MS = 8000 // how long GET /api/target carries an alert: the glasses poll it once a second
+const ALERTS_KEPT = 200
+const ALERTS_INDEX = 'alerts-influence'
+const alerts = [] // oldest first
+const alerting = new Map() // seekerId -> { inside, foundArmed, lastKey, lastAt, latest, held, heldTimer, lostTimer, lastFt }
+let alertsFired = 0
+let lastAlertMs = 0
+
+function resetAlerts(seekerId) {
+  const a = alerting.get(seekerId)
+  if (!a) return
+  clearTimeout(a.heldTimer)
+  clearTimeout(a.lostTimer)
+  alerting.delete(seekerId)
+}
+
+function checkDistance(seekerId, beaconId, metres) {
+  const t = state.targets.get(seekerId)
+  if (!t || t.beaconId !== beaconId || metres == null) return
+  let a = alerting.get(seekerId)
+  if (!a) alerting.set(seekerId, (a = { inside: new Map(), foundArmed: true, lastKey: null, lastAt: 0, latest: null, held: null, heldTimer: null, lostTimer: null, lastFt: null }))
+  const ft = metres * FT_PER_M
+  a.lastFt = ft
+  clearTimeout(a.lostTimer)
+  a.lostTimer = setTimeout(() => offer(seekerId, { kind: 'lost', feet: null, ft: a.lastFt }), LOST_MS)
+  a.lostTimer.unref()
+  const closer = []
+  const farther = []
+  for (const line of LINES_FT) {
+    const was = a.inside.get(line)
+    const inside = ft < line ? true : ft >= line + BAND_FT ? false : was
+    a.inside.set(line, inside)
+    if (was === false && inside === true) closer.push(line)
+    if (was === true && inside === false && FARTHER_FT.includes(line)) farther.push(line)
+  }
+  let crossing = null
+  if (ft <= FOUND_FT && a.foundArmed) {
+    a.foundArmed = false
+    crossing = { kind: 'found', feet: FOUND_FT }
+  } else if (closer.length) crossing = { kind: 'closer', feet: Math.min(...closer) }
+  else if (farther.length) crossing = { kind: 'farther', feet: Math.max(...farther) }
+  if (ft > FOUND_REARM_FT) a.foundArmed = true
+  if (crossing) offer(seekerId, { ...crossing, ft })
+}
+
+// The latest crossing wins: one inside the gap since the last alert waits for it, replacing any already waiting.
+function offer(seekerId, crossing) {
+  const a = alerting.get(seekerId)
+  if (!a) return
+  const wait = a.lastAt + ALERT_GAP_MS - Date.now()
+  if (wait <= 0) {
+    a.held = null
+    return fire(seekerId, a, crossing)
+  }
+  a.held = crossing
+  if (a.heldTimer) return
+  a.heldTimer = setTimeout(() => {
+    const held = a.held
+    a.held = a.heldTimer = null
+    if (held) fire(seekerId, a, held)
+  }, wait)
+  a.heldTimer.unref()
+}
+
+function fire(seekerId, a, { kind, feet, ft }) {
+  const key = `${kind}:${feet}`
+  const t = state.targets.get(seekerId)
+  if (key === a.lastKey || !t) return
+  const name = (t.influencerId && state.influencers.get(t.influencerId)?.name) || (t.beaconId && state.beacons.get(t.beaconId)?.name) || 'your target'
+  lastAlertMs = Math.max(Date.now(), lastAlertMs + 1) // ids stay unique, even two in one millisecond
+  const alert = {
+    id: `${seekerId}-${lastAlertMs}`,
+    seekerId,
+    influencerId: t.influencerId || null,
+    name,
+    beaconId: t.beaconId || null,
+    kind,
+    feet,
+    distanceFt: ft == null ? null : Math.round(ft * 10) / 10,
+    at: now(),
+    message: { closer: `${name} within ${feet} ft`, found: `Found ${name}`, farther: `${name} moving away, ${feet} ft`, lost: `Lost ${name}` }[kind],
+  }
+  a.lastKey = key
+  a.lastAt = Date.now()
+  a.latest = alert
+  alerts.push(alert)
+  if (alerts.length > ALERTS_KEPT) alerts.shift()
+  alertsFired += 1
+  esPut(ALERTS_INDEX, alert.id, alert)
+  const data = `event: alert\ndata: ${JSON.stringify(alert)}\n\n`
+  for (const res of clients) res.write(data)
+}
+
+// The seeker's latest alert while it is fresh, for the glasses' poll of GET /api/target.
+function recentAlert(seekerId) {
+  const latest = alerting.get(seekerId)?.latest
+  return latest && Date.now() - Date.parse(latest.at) <= ALERT_FRESH_MS ? latest : null
+}
+
+function listAlerts(seekerId, limit) {
+  const out = []
+  for (let i = alerts.length - 1; i >= 0 && out.length < limit; i--) if (!seekerId || alerts[i].seekerId === seekerId) out.push(alerts[i])
+  return out
+}
+
+// ---------- integrations: what /live/ shows; hosts only, never a secret, a header or a key ----------
+
+const hostOf = (u) => {
+  try {
+    return u ? new URL(u).hostname || null : null
+  } catch {
+    return null
+  }
+}
+const OTEL_ENDPOINT = process.env.OTEL_EXPORTER_OTLP_ENDPOINT || ''
+// The Radar bridge's heartbeat (deploy/radar-bridge): how many Events it made, and the last one.
+const radar = { lastSeen: null, mirrored: 0, lastEvent: null }
+function integrations() {
+  return {
+    elasticsearch: { on: !!ES_URL, url: hostOf(ES_URL) },
+    telemetry: { on: !!OTEL_ENDPOINT && process.env.OTEL_SDK_DISABLED !== 'true', endpoint: hostOf(OTEL_ENDPOINT) },
+    radar: { ...radar },
+    alerts: { count: alertsFired, last: alerts.at(-1) || null },
+  }
+}
 
 // ---------- a demo walk, for when no beacon is in the room ----------
 
@@ -560,9 +706,24 @@ const server = http.createServer(async (req, res) => {
       return send(res, 201, list.map(addReading))
     }
     if (kind === 'seekers' && id && (req.method === 'POST' || req.method === 'PUT')) return send(res, 200, setSeeker(slug(id), await readBody(req)))
+    // Newest first, of one seeker or all: GET /api/alerts?seeker=<id>&limit=20.
+    if (kind === 'alerts' && !id && req.method === 'GET') {
+      const seeker = u.searchParams.get('seeker')
+      const limit = Math.min(ALERTS_KEPT, Math.max(1, Math.floor(num(u.searchParams.get('limit')) || 20)))
+      return send(res, 200, listAlerts(seeker ? slug(seeker) : null, limit))
+    }
+    if (kind === 'integrations' && !id && req.method === 'GET') return send(res, 200, integrations())
+    // The Radar bridge's heartbeat, open like readings: {mirrored, lastEvent}.
+    if (kind === 'integrations' && id === 'radar' && req.method === 'POST') {
+      const body = await readBody(req)
+      radar.mirrored = Math.max(0, Math.floor(num(body.mirrored) ?? 0))
+      radar.lastEvent = body.lastEvent ? str(body.lastEvent, 300) : null
+      radar.lastSeen = now()
+      return send(res, 200, radar)
+    }
     if (kind === 'target') {
       const seeker = u.searchParams.get('seeker') || 'phone'
-      if (req.method === 'GET') return send(res, 200, describeTarget(state.targets.get(slug(seeker))) || { seekerId: slug(seeker), target: null })
+      if (req.method === 'GET') return send(res, 200, { ...(describeTarget(state.targets.get(slug(seeker))) || { seekerId: slug(seeker), target: null }), alert: recentAlert(slug(seeker)) })
       if (req.method === 'PUT' || req.method === 'POST') {
         const body = await readBody(req)
         return send(res, 200, setTarget(body.seeker || seeker, body.name || body.influencer || body.beacon || null))
