@@ -203,6 +203,7 @@ function setTarget(seekerId, who) {
   const sid = slug(seekerId || 'phone') || 'phone'
   if (!who) {
     state.targets.delete(sid)
+    esDelete(TARGETS_INDEX, sid)
     changed()
     return { seekerId: sid, target: null }
   }
@@ -211,6 +212,8 @@ function setTarget(seekerId, who) {
   if (!inf && !beacon) throw httpError(404, `nobody named ${who} is registered`)
   const t = { seekerId: sid, influencerId: inf?.id || beacon?.influencerId || null, beaconId: beacon?.id || null, at: now() }
   state.targets.set(sid, t)
+  // Kept in Elasticsearch, so a deploy never drops who a phone is finding: the phone ranges only its target's beacon.
+  esPut(TARGETS_INDEX, sid, t)
   changed()
   return describeTarget(t)
 }
@@ -298,8 +301,26 @@ async function es(method, path, body) {
   if (!res.ok && res.status !== 404) throw new Error(`elasticsearch ${method} ${path}: ${res.status}`)
   return res.status === 404 ? null : res.json()
 }
+// Each seeker's target, one document per seeker id. Not influence-* or kubecon-*: search runs over those patterns,
+// and a target is not a result.
+const TARGETS_INDEX = 'seek-targets'
+// Writes to one document go out one after another, in the order they were made, so a target set and then cleared
+// ends cleared in Elasticsearch too. A failed write only logs: it never fails the request that made it.
+const esWrites = new Map() // `${index}/${id}` -> the latest write to that document
+function esWrite(method, index, id, doc) {
+  if (!ES_URL) return
+  const key = `${index}/${id}`
+  const write = (esWrites.get(key) || Promise.resolve())
+    .then(() => es(method, `/${index}/_doc/${encodeURIComponent(id)}`, doc))
+    .catch((e) => console.warn(e.message))
+    .finally(() => esWrites.get(key) === write && esWrites.delete(key))
+  esWrites.set(key, write)
+}
 function esPut(index, id, doc) {
-  es('PUT', `/${index}/_doc/${encodeURIComponent(id)}`, doc).catch((e) => console.warn(e.message))
+  esWrite('PUT', index, id, doc)
+}
+function esDelete(index, id) {
+  esWrite('DELETE', index, id)
 }
 async function esLoad() {
   if (!ES_URL) return
@@ -311,6 +332,32 @@ async function esLoad() {
     console.log(`loaded the registry from ${ES_URL}`)
   } catch (e) {
     console.warn(`elasticsearch not reachable, the registry stays in memory: ${e.message}`)
+  }
+}
+// Each seeker's target, after the registry it names. Unreachable, the API starts with no targets and says so.
+async function esLoadTargets() {
+  if (!ES_URL) return
+  try {
+    const r = await es('POST', `/${TARGETS_INDEX}/_search`, { size: 500, query: { match_all: {} } })
+    for (const h of r?.hits?.hits || []) {
+      const t = h._source
+      if (t?.seekerId) state.targets.set(t.seekerId, t)
+    }
+    console.log(`loaded ${state.targets.size} seek target(s) from ${ES_URL}`)
+  } catch (e) {
+    console.warn(`elasticsearch not reachable, the seek targets start empty: ${e.message}`)
+  }
+}
+// The registry the hackathon starts with, kept in git (registry fields only, never a key). It fills only the
+// influencers and beacons Elasticsearch does not have: a restart must not undo what an influencer set on their own
+// page. Influencers go first, since a beacon names its influencer.
+function seedRegistry() {
+  try {
+    const seed = JSON.parse(readFileSync(new URL('./registry.seed.json', import.meta.url), 'utf8'))
+    for (const i of seed.influencers || []) if (!state.influencers.has(i.id)) upsertInfluencer(i, { keepId: i.id })
+    for (const b of seed.beacons || []) if (!state.beacons.has(b.id)) upsertBeacon(b, { keepId: b.id })
+  } catch (e) {
+    console.warn(`the seed registry did not load, the API starts on what Elasticsearch has: ${e.message}`)
   }
 }
 async function search(q) {
@@ -536,13 +583,12 @@ const server = http.createServer(async (req, res) => {
   }
 })
 
-// The registry Elasticsearch kept, then the two influencers the hackathon starts with, only where it has none: a
-// restart must not undo what an influencer set on their own page.
+// The registry Elasticsearch kept, then the seed in git only where it has none, then each seeker's target.
 await esLoad()
-if (!state.influencers.has('kelsey')) upsertInfluencer({ id: 'kelsey', name: 'Kelsey', tagline: 'Find me at KubeCon', color: '#3DA992' })
-if (!state.influencers.has('kunal')) upsertInfluencer({ id: 'kunal', name: 'Kunal', tagline: 'Find me at KubeCon', color: '#8B7CF6' })
-if (!state.beacons.has('beacon-1')) upsertBeacon({ id: 'beacon-1', name: 'Beacon 1', influencerId: 'kelsey' })
-if (!state.beacons.has('beacon-2')) upsertBeacon({ id: 'beacon-2', name: 'Beacon 2', influencerId: 'kunal' })
+seedRegistry()
+await esLoadTargets()
 
-server.listen(PORT, () => console.log(`influence-api ${VERSION} on :${PORT}${ES_URL ? `, Elasticsearch at ${ES_URL}` : ''}`))
-for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => server.close(() => process.exit(0)))
+// The port as bound, so PORT=0 (any free port, as the tests run it) says which one it got.
+server.listen(PORT, () => console.log(`influence-api ${VERSION} on :${server.address().port}${ES_URL ? `, Elasticsearch at ${ES_URL}` : ''}`))
+// On a deploy's SIGTERM, the writes still on their way to Elasticsearch land before the process exits.
+for (const sig of ['SIGTERM', 'SIGINT']) process.on(sig, () => server.close(() => Promise.all(esWrites.values()).then(() => process.exit(0))))

@@ -1,0 +1,52 @@
+{
+  "influencers": [
+    {
+      "id": "kelsey",
+      "name": "Kelsey",
+      "handle": "",
+      "tagline": "Find me at KubeCon",
+      "bio": "",
+      "imageUrl": "",
+      "color": "#3DA992",
+      "emoji": "",
+      "show": {
+        "name": true,
+        "photo": true,
+        "tagline": true,
+        "distance": true
+      },
+      "visible": true
+    },
+    {
+      "id": "kunal",
+      "name": "Kunal",
+      "handle": "",
+      "tagline": "Find me at KubeCon",
+      "bio": "",
+      "imageUrl": "",
+      "color": "#8B7CF6",
+      "emoji": "",
+      "show": {
+        "name": true,
+        "photo": true,
+        "tagline": true,
+        "distance": true
+      },
+      "visible": true
+    }
+  ],
+  "beacons": [
+    {
+      "id": "beacon-1",
+      "name": "Beacon 1",
+      "hardwareId": "86E7C53A",
+      "influencerId": "kelsey"
+    },
+    {
+      "id": "beacon-2",
+      "name": "Beacon 2",
+      "hardwareId": "CA588E78",
+      "influencerId": "kunal"
+    }
+  ]
+}
