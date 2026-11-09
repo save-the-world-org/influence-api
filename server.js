@@ -431,7 +431,7 @@ const server = http.createServer(async (req, res) => {
     const [, kind, id] = parts
     if (kind === 'influencers') {
       if (req.method === 'GET' && !id) return send(res, 200, [...state.influencers.values()])
-      if (req.method === 'GET') return state.influencers.has(id) ? send(res, 200, state.influencers.get(id)) : send(res, 404, { error: `no influencer ${id}` })
+      if (req.method === 'GET' && !parts[3]) return state.influencers.has(id) ? send(res, 200, state.influencers.get(id)) : send(res, 404, { error: `no influencer ${id}` })
       if (req.method === 'POST' && !id) {
         requireWriter(req)
         const inf = upsertInfluencer(await readBody(req))
