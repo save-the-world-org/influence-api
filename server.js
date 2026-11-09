@@ -14,8 +14,9 @@ const PROFILE_SECRET = process.env.PROFILE_SECRET || WRITE_KEY || randomBytes(32
 // Optional Elasticsearch: the registry is written through to it and search runs on it.
 const ES_URL = (process.env.ES_URL || '').replace(/\/$/, '')
 const ES_AUTH = process.env.ES_AUTH || '' // "ApiKey <base64>" or "Basic <base64>"
-// The Salt Palace Convention Center, Salt Lake City: where the map opens and the demo walks.
-const VENUE = { lat: 40.7672, lon: -111.8947 }
+// The Salt Palace Convention Center, Salt Lake City (the centre of OpenStreetMap's way 33149360): where the map
+// opens and the demo walks.
+const VENUE = { lat: 40.767437, lon: -111.8962966 }
 
 const state = {
   influencers: new Map(),
@@ -297,9 +298,9 @@ async function search(q) {
   if (!term) return []
   if (ES_URL) {
     try {
-      const r = await es('POST', '/influence-*/_search', {
+      const r = await es('POST', '/influence-*,kubecon-*/_search', {
         size: 20,
-        query: { multi_match: { query: term, fields: ['name^3', 'handle^2', 'tagline', 'bio', 'title', 'speakers', 'description'], fuzziness: 'AUTO' } },
+        query: { multi_match: { query: term, fields: ['name^3', 'title^3', 'handle^2', 'tagline', 'speakers^2', 'company', 'room', 'track', 'bio', 'description'], fuzziness: 'AUTO' } },
       })
       return (r?.hits?.hits || []).map((h) => ({ index: h._index, id: h._id, score: h._score, ...h._source }))
     } catch (e) {
