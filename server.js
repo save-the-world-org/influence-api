@@ -245,7 +245,8 @@ function snapshot() {
     return { ...b, influencer: inf && inf.visible !== false ? inf : null, reading: state.readings.get(b.id) || null }
   })
   const targets = [...state.targets.values()].map(describeTarget)
-  return { version: VERSION, venue: VENUE, at: now(), influencers, beacons, seekers: [...state.seekers.values()], targets, demo: !!demo.timer }
+  const seekers = [...state.seekers.values()].map((s) => ({ ...s, frameAt: freshFrame(s.id)?.at || null }))
+  return { version: VERSION, venue: VENUE, at: now(), influencers, beacons, seekers, targets, demo: !!demo.timer }
 }
 
 // ---------- the live stream ----------
@@ -263,6 +264,41 @@ function changed() {
 setInterval(() => {
   for (const res of clients) res.write(': keep-alive\n\n')
 }, 15000).unref()
+
+// ---------- camera frames ----------
+
+// The glasses' camera, relayed by the phone: only the latest JPEG per seeker, in memory, never to Elasticsearch or disk.
+// Posting one is open like readings; reading it back needs the write key when one is set. A frame older than
+// FRAME_FRESH_MS counts as none. The stream says `event: frame` with {seekerId, at}, never the bytes, at most twice a
+// second per seeker: a frame inside the half second waits for it, and the event then names the latest.
+const FRAME_MAX_BYTES = 400 * 1024
+const FRAME_FRESH_MS = Number(process.env.FRAME_FRESH_MS || 30000)
+const FRAME_EVENT_MS = 500
+const frames = new Map() // seekerId -> { buf, at }
+const frameEvents = new Map() // seekerId -> { sentAt, timer }
+
+function freshFrame(seekerId) {
+  const f = frames.get(seekerId)
+  return f && Date.now() - Date.parse(f.at) <= FRAME_FRESH_MS ? f : null
+}
+
+function setFrame(seekerId, buf) {
+  frames.set(seekerId, { buf, at: now() })
+  let e = frameEvents.get(seekerId)
+  if (!e) frameEvents.set(seekerId, (e = { sentAt: 0, timer: null }))
+  const announce = () => {
+    e.timer = null
+    e.sentAt = Date.now()
+    const data = `event: frame\ndata: ${JSON.stringify({ seekerId, at: frames.get(seekerId).at })}\n\n`
+    for (const res of clients) res.write(data)
+  }
+  const wait = e.sentAt + FRAME_EVENT_MS - Date.now()
+  if (wait <= 0) announce()
+  else if (!e.timer) {
+    e.timer = setTimeout(announce, wait)
+    e.timer.unref()
+  }
+}
 
 // ---------- distance alerts ----------
 
@@ -639,6 +675,17 @@ async function readBody(req) {
     throw httpError(400, 'the body is not JSON')
   }
 }
+// A body as bytes, for a camera frame. Over max is a 413, once the rest is read and dropped, so the answer gets back.
+async function readRaw(req, max) {
+  let size = 0
+  const chunks = []
+  for await (const c of req) {
+    size += c.length
+    if (size <= max) chunks.push(c)
+  }
+  if (size > max) throw httpError(413, `the frame is over ${max / 1024} KB`)
+  return Buffer.concat(chunks)
+}
 const bearer = (req) => (req.headers.authorization || '').replace(/^Bearer\s+/i, '')
 const isWriter = (req) => !WRITE_KEY || bearer(req) === WRITE_KEY
 const canEditProfile = (req, id) => isWriter(req) || bearer(req) === profileKey(id)
@@ -733,6 +780,24 @@ const server = http.createServer(async (req, res) => {
       const body = await readBody(req)
       const list = Array.isArray(body) ? body : [body]
       return send(res, 201, list.map(addReading))
+    }
+    // The glasses' camera, relayed by the phone: POST /api/seekers/<id>/frame a JPEG, open like readings; GET it back with
+    // the write key, while it is under FRAME_FRESH_MS old.
+    if (kind === 'seekers' && id && parts[3] === 'frame') {
+      const seekerId = slug(id)
+      if (req.method === 'POST' || req.method === 'PUT') {
+        const buf = await readRaw(req, FRAME_MAX_BYTES)
+        if (!buf.length) throw httpError(400, 'a frame needs a JPEG body')
+        setFrame(seekerId, buf)
+        return send(res, 204)
+      }
+      if (req.method === 'GET') {
+        if (!isWriter(req)) throw httpError(401, 'the camera needs Authorization: Bearer <write key>')
+        const f = freshFrame(seekerId)
+        if (!f) return send(res, 404, { error: `no recent frame from ${seekerId}` })
+        res.writeHead(200, { ...CORS, 'access-control-expose-headers': 'x-frame-at', 'content-type': 'image/jpeg', 'content-length': f.buf.length, 'cache-control': 'no-store', 'x-frame-at': f.at })
+        return res.end(f.buf)
+      }
     }
     if (kind === 'seekers' && id && (req.method === 'POST' || req.method === 'PUT')) return send(res, 200, setSeeker(slug(id), await readBody(req)))
     // Newest first, of one seeker or all: GET /api/alerts?seeker=<id>&limit=20.
