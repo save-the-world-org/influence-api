@@ -24,7 +24,8 @@ const state = {
   influencers: new Map(),
   beacons: new Map(),
   seekers: new Map(), // id -> { lat, lon, accuracy, heading, at }
-  readings: new Map(), // beaconId -> latest reading, with its estimate
+  readings: new Map(), // beaconId -> latest reading from any seeker, with its estimate (the map)
+  seekerReadings: new Map(), // `${seekerId}|${beaconId}` -> that seeker's latest reading of that beacon
   targets: new Map(), // seekerId -> { influencerId, beaconId, at }
 }
 
@@ -105,10 +106,20 @@ function resolveInfluencer(q) {
   return best
 }
 
+// A beacon's ID is the 8 hex digits of its DEVICEADDR[0], found inside the name it advertises:
+// "Hero Finder (86E7C53A)" and "DWM3001CDK (86E7C53A)" are both 86E7C53A.
+const hexId = (s) => (String(s || '').match(/(?:^|[^0-9A-Fa-f])([0-9A-Fa-f]{8})(?![0-9A-Fa-f])/) || [])[1]?.toUpperCase() || null
+
 function resolveBeacon(q) {
   if (!q) return null
   const key = String(q).trim()
-  return state.beacons.get(slug(key)) || [...state.beacons.values()].find((b) => b.hardwareId && b.hardwareId === key) || null
+  const hex = hexId(key)
+  return (
+    state.beacons.get(slug(key)) ||
+    [...state.beacons.values()].find((b) => b.hardwareId && b.hardwareId === key) ||
+    (hex && [...state.beacons.values()].find((b) => hexId(b.hardwareId) === hex)) ||
+    null
+  )
 }
 
 const beaconOf = (influencerId) => [...state.beacons.values()].find((b) => b.influencerId === influencerId) || null
@@ -164,8 +175,10 @@ function addReading(input) {
     trend: str(input.trend, 20),
     at: now(),
   }
+  r.hardwareId = hexId(beacon.hardwareId) || beacon.hardwareId || null
   r.estimate = estimate({ ...r, lat: input.lat, lon: input.lon }, seeker)
   state.readings.set(beacon.id, r)
+  state.seekerReadings.set(`${seekerId}|${beacon.id}`, r)
   changed()
   return r
 }
@@ -209,8 +222,12 @@ function describeTarget(t) {
   return {
     ...t,
     name: inf?.name || beacon?.name || null,
-    hardwareId: beacon?.hardwareId || null,
-    lastReading: beacon ? state.readings.get(beacon.id) || null : null,
+    // The beacon's ID, the 8 hex digits of DEVICEADDR[0] the phone finds in the advertised name; the name as
+    // registered stays in hardwareName.
+    hardwareId: hexId(beacon?.hardwareId) || beacon?.hardwareId || null,
+    hardwareName: beacon?.hardwareId || null,
+    // This seeker's own latest reading of the beacon, never another seeker's.
+    lastReading: beacon ? state.seekerReadings.get(`${t.seekerId}|${beacon.id}`) || null : null,
     note: beacon ? null : `${inf?.name} has no beacon yet: map one in the registry`,
   }
 }
@@ -262,6 +279,7 @@ function setDemo(on) {
     demo.timer = null
     state.seekers.delete('demo')
     for (const [id, r] of state.readings) if (r.seekerId === 'demo') state.readings.delete(id)
+    for (const [k, r] of state.seekerReadings) if (r.seekerId === 'demo') state.seekerReadings.delete(k)
   }
   changed()
   return { demo: !!demo.timer }
@@ -472,10 +490,22 @@ const server = http.createServer(async (req, res) => {
         requireWriter(req)
         state.beacons.delete(id)
         state.readings.delete(id)
+        for (const [k, r] of state.seekerReadings) if (r.beaconId === id) state.seekerReadings.delete(k)
         es('DELETE', `/influence-beacons/_doc/${encodeURIComponent(id)}`).catch(() => {})
         changed()
         return send(res, 204)
       }
+    }
+    // A seeker's latest reading (of one beacon with &beacon=), with its age: GET /api/readings?seeker=<id>.
+    if (kind === 'readings' && req.method === 'GET') {
+      const seekerId = slug(u.searchParams.get('seeker') || 'phone') || 'phone'
+      const b = u.searchParams.get('beacon') ? resolveBeacon(u.searchParams.get('beacon')) : null
+      let latest = null
+      for (const r of state.seekerReadings.values()) {
+        if (r.seekerId !== seekerId || (b && r.beaconId !== b.id)) continue
+        if (!latest || r.at > latest.at) latest = r
+      }
+      return send(res, 200, { seekerId, reading: latest, at: latest?.at || null, ageMs: latest ? Date.now() - Date.parse(latest.at) : null })
     }
     if (kind === 'readings' && req.method === 'POST') {
       const body = await readBody(req)
