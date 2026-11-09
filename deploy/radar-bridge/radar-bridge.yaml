@@ -17,14 +17,18 @@ metadata:
     app.kubernetes.io/name: radar-bridge
 data:
   bridge.mjs: |
-    // Polls influence-api's alerts every 2 s and posts each new one as a core/v1 Event through the Kubernetes API,
-    // with the pod's ServiceAccount token and CA, then sends influence-api a heartbeat. Plain Node 22, no
-    // dependencies. Errors only log.
+    // v2. Every 2 s: polls influence-api's alerts and posts each new one as a core/v1 Event through the Kubernetes
+    // API, with the pod's ServiceAccount token and CA, the alert's id in an annotation and the message; then reads
+    // the Hero* Events back from Skyhook Radar's HTTP API (GET /api/events?namespace=, the one its UI uses) and posts
+    // each new one to influence-api's POST /api/radar/alerts, which marks the alert Radar's; then sends a heartbeat.
+    // Plain Node 22, no dependencies. Errors only log.
     import https from 'node:https'
     import { readFileSync } from 'node:fs'
 
     const API = (process.env.API || 'https://influence-api.darkshift.cloud').replace(/\/$/, '')
+    const RADAR = (process.env.RADAR || 'http://radar:9280').replace(/\/$/, '')
     const NAMESPACE = 'influence-api-production'
+    const ALERT_ID = 'influence.darkshift.io/alert-id'
     const SA = '/var/run/secrets/kubernetes.io/serviceaccount'
     const COMPONENT = 'influence-radar-bridge'
     const INSTANCE = (process.env.HOSTNAME || COMPONENT).slice(0, 128)
@@ -33,6 +37,9 @@ data:
     const seen = new Set()
     let mirrored = 0 // Events created since start
     let lastEvent = null // the last one's reason and message
+    const read = new Set() // Radar's Event uids already handled
+    let confirmed = 0 // alerts influence-api marked Radar's since start
+    let radarSince = started - 60000 // Events older than this are never read: a restart does not replay the past
 
     const log = (what, e) => console.error(`radar-bridge: ${what}: ${e?.message || e}`)
     process.on('unhandledRejection', (e) => log('unhandled', e))
@@ -76,13 +83,13 @@ data:
     async function mirror(alert) {
       const at = new Date()
       const reason = REASONS[alert.kind] || 'HeroAlert'
-      const message = `${alert.message} (seeker ${alert.seekerId})`
+      const message = `${alert.message} (seeker ${alert.seekerId}) [alert ${alert.id}]`
       // Named after the alert, so posting one again (after a restart) is a 409, never a second Event.
       const id = String(alert.id).toLowerCase().replace(/[^a-z0-9.-]+/g, '-').replace(/^[^a-z0-9]+|[^a-z0-9]+$/g, '')
       const res = await kube('POST', `/api/v1/namespaces/${NAMESPACE}/events`, {
         apiVersion: 'v1',
         kind: 'Event',
-        metadata: { name: `influence-api.${id}`.slice(0, 253), namespace: NAMESPACE },
+        metadata: { name: `influence-api.${id}`.slice(0, 253), namespace: NAMESPACE, annotations: { [ALERT_ID]: String(alert.id) } },
         involvedObject: { apiVersion: 'apps/v1', kind: 'Deployment', name: 'influence-api', namespace: NAMESPACE },
         reason,
         type: alert.kind === 'lost' ? 'Warning' : 'Normal',
@@ -128,12 +135,50 @@ data:
       if (seen.size > 1000) for (const id of [...seen].slice(0, seen.size - 500)) seen.delete(id)
     }
 
+    // Radar's view of the namespace's Events, full core/v1 objects: the Hero* ones newer than the last read, oldest
+    // first, each posted to influence-api, which marks the alert Radar's and sends it to the stream again.
+    const when = (e) => Date.parse(e.eventTime || e.lastTimestamp || e.firstTimestamp || e.metadata?.creationTimestamp) || 0
+    async function readRadar() {
+      const res = await fetch(`${RADAR}/api/events?namespace=${NAMESPACE}`, { signal: AbortSignal.timeout(5000) })
+      if (!res.ok) throw new Error(`Radar GET /api/events: ${res.status}`)
+      const body = await res.json()
+      const events = (Array.isArray(body) ? body : body?.items || [])
+        .filter((e) => /^Hero/.test(e?.reason || '') && e.metadata?.uid && !read.has(e.metadata.uid) && when(e) >= radarSince)
+        .sort((a, b) => when(a) - when(b))
+      for (const e of events) {
+        const alertId = e.metadata.annotations?.[ALERT_ID] || /\[alert ([^\]]+)\]\s*$/.exec(e.message || '')?.[1]
+        if (!alertId) {
+          read.add(e.metadata.uid) // a v1 Event, with no alert id
+          continue
+        }
+        const at = new Date(when(e)).toISOString()
+        try {
+          const r = await fetch(`${API}/api/radar/alerts`, {
+            method: 'POST',
+            headers: { 'content-type': 'application/json' },
+            body: JSON.stringify({ alertId, radarEventId: e.metadata.uid, reason: e.reason, message: e.message, at, seekerId: /\(seeker ([^)]+)\)/.exec(e.message || '')?.[1] || null }),
+            signal: AbortSignal.timeout(5000),
+          })
+          if (r.ok) {
+            confirmed += 1
+            console.log(`radar-bridge: Radar confirmed ${alertId} (${e.reason})`)
+          } else if (r.status !== 404) throw new Error(`POST /api/radar/alerts: ${r.status}`)
+          else log(`confirm ${alertId}`, 'influence-api does not know it (404)')
+          read.add(e.metadata.uid)
+          radarSince = Math.max(radarSince, when(e) - 60000)
+        } catch (err) {
+          log(`confirm ${alertId}`, err) // read again on the next tick
+        }
+      }
+      if (read.size > 1000) for (const uid of [...read].slice(0, read.size - 500)) read.delete(uid)
+    }
+
     // The heartbeat /live/ shows: GET /api/integrations answers it as radar.
     async function heartbeat() {
       const res = await fetch(`${API}/api/integrations/radar`, {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ mirrored, lastEvent }),
+        body: JSON.stringify({ mirrored, confirmed, lastEvent }),
         signal: AbortSignal.timeout(5000),
       })
       if (!res.ok) throw new Error(`POST /api/integrations/radar: ${res.status}`)
@@ -146,6 +191,11 @@ data:
         log('poll', e)
       }
       try {
+        await readRadar()
+      } catch (e) {
+        log('Radar', e)
+      }
+      try {
         await heartbeat()
       } catch (e) {
         log('heartbeat', e)
@@ -153,7 +203,7 @@ data:
       setTimeout(tick, 2000)
     }
 
-    console.log(`radar-bridge: alerts from ${API} to Events on deployment/influence-api in ${NAMESPACE}`)
+    console.log(`radar-bridge: alerts from ${API} to Events on deployment/influence-api in ${NAMESPACE}, read back from Radar at ${RADAR}`)
     tick()
 ---
 apiVersion: rbac.authorization.k8s.io/v1
@@ -217,6 +267,9 @@ spec:
             # The org's network fence blocks the in-cluster Service from this namespace; the public address is reachable.
             - name: API
               value: https://influence-api.darkshift.cloud
+            # Skyhook Radar's Service, in this namespace: the bridge reads the Events back through its HTTP API.
+            - name: RADAR
+              value: http://radar:9280
           resources:
             requests:
               cpu: 20m

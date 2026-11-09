@@ -228,7 +228,8 @@ test('walking up to Kunal fires closer at 30, 20, 10 and 5 ft, then found: on th
   assert.deepEqual(oldestFirst.map((a) => a.message), ['Kunal within 30 ft', 'Kunal within 20 ft', 'Kunal within 10 ft', 'Kunal within 5 ft', 'Found Kunal'])
   assert.deepEqual(oldestFirst.map((a) => a.distanceFt), [29.5, 19.4, 9.5, 4.6, 2.6])
   const found = list[0]
-  assert.deepEqual(Object.keys(found).sort(), ['at', 'beaconId', 'distanceFt', 'feet', 'id', 'influencerId', 'kind', 'message', 'name', 'seekerId'])
+  assert.deepEqual(Object.keys(found).sort(), ['at', 'beaconId', 'distanceFt', 'feet', 'id', 'influencerId', 'kind', 'message', 'name', 'seekerId', 'source'])
+  assert.equal(found.source, 'api')
   assert.deepEqual([found.seekerId, found.influencerId, found.name, found.beaconId], ['phone', 'kunal', 'Kunal', 'beacon-2'])
   assert.match(found.id, /^phone-\d+$/)
   assert.equal(new Set(list.map((a) => a.id)).size, 5)
@@ -305,7 +306,7 @@ test('integrations show what is on by host only, never a key or a header, and th
   assert.deepEqual(before, {
     elasticsearch: { on: true, url: '127.0.0.1' },
     telemetry: { on: true, endpoint: 'ingress.us-west-2.aws.dash0.com' },
-    radar: { lastSeen: null, mirrored: 0, lastEvent: null },
+    radar: { lastSeen: null, mirrored: 0, lastEvent: null, confirmed: 0, lastConfirmedAt: null, latencyMs: null },
     alerts: { count: 0, last: null },
   })
   await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
@@ -332,4 +333,74 @@ test('the Radar bridge heartbeat is open and sets lastSeen, the count and the la
   assert.equal(radar.mirrored, 3)
   assert.equal(radar.lastEvent, 'HeroFound: Found Kunal (seeker phone)')
   assert.ok(Date.parse(radar.lastSeen) >= before - 1000 && Date.parse(radar.lastSeen) <= Date.now())
+})
+
+// ---------- Radar-confirmed alerts ----------
+
+// One alert, Kunal within 10 ft, fired by the phone's readings: answers it.
+async function oneAlert(server) {
+  await server.call('PUT', '/api/target?seeker=phone', { name: 'Kunal' })
+  await walk(server, [M(13), M(9)], 0)
+  const [alert] = await server.get('/api/alerts?seeker=phone')
+  assert.equal(alert.message, 'Kunal within 10 ft')
+  return alert
+}
+
+test('Radar confirming an alert makes it Radar\'s: same id, on the list, the stream, the target and integrations', async (t) => {
+  const server = await startServer(null, { ALERT_GAP_MS: '50', WRITE_KEY: 'a-write-key' })
+  t.after(() => server.stop())
+  const stream = server.stream('/api/events')
+  t.after(() => stream.close())
+  await until('the stream open', () => stream.text().includes('event: state'))
+  assert.equal((await server.call('POST', '/api/integrations/radar', { mirrored: 1, confirmed: 0 })).status, 200)
+  const alert = await oneAlert(server)
+  assert.equal(alert.source, 'api')
+  // Radar is live, so the target waits for Radar's word.
+  assert.equal((await server.get('/api/target?seeker=phone')).alert, null)
+
+  const res = await server.call('POST', '/api/radar/alerts', { alertId: alert.id, radarEventId: 'uid-1', reason: 'HeroCloser', message: `Kunal within 10 ft (seeker phone) [alert ${alert.id}]`, at: new Date().toISOString(), seekerId: 'phone' })
+  assert.equal(res.status, 200) // no key needed, like readings
+  assert.equal(res.body.id, alert.id)
+  assert.equal(res.body.source, 'radar')
+  assert.equal(res.body.radarReason, 'HeroCloser')
+  assert.equal(res.body.radarEventId, 'uid-1')
+  assert.ok(Date.parse(res.body.radarAt) >= Date.parse(alert.at))
+
+  const [listed] = await server.get('/api/alerts?seeker=phone')
+  assert.deepEqual(listed, res.body)
+  assert.deepEqual((await server.get('/api/target?seeker=phone')).alert, res.body)
+  await until('the confirmed alert on the stream', () => stream.text().includes('"source":"radar"'))
+  const sent = stream.text().split('\n\n').filter((m) => m.startsWith('event: alert')).map((m) => JSON.parse(m.split('data: ')[1]))
+  assert.deepEqual(sent.map((a) => [a.id, a.source]), [[alert.id, 'api'], [alert.id, 'radar']])
+  const { radar } = await server.get('/api/integrations')
+  assert.equal(radar.confirmed, 1)
+  assert.equal(radar.lastConfirmedAt, res.body.radarAt)
+  assert.equal(radar.latencyMs, Date.parse(res.body.radarAt) - Date.parse(alert.at))
+
+  // Twice is once: no second confirmation, no second broadcast.
+  const again = await server.call('POST', '/api/radar/alerts', { alertId: alert.id, radarEventId: 'uid-2', reason: 'HeroCloser' })
+  assert.deepEqual([again.status, again.body.radarEventId], [200, 'uid-1'])
+  assert.equal((await server.get('/api/integrations')).radar.confirmed, 1)
+})
+
+test('with the Radar heartbeat stale, the target falls back to the API\'s latest alert', async (t) => {
+  const server = await startServer(null, { ALERT_GAP_MS: '50', RADAR_STALE_MS: '300' })
+  t.after(() => server.stop())
+  await server.call('POST', '/api/integrations/radar', { mirrored: 0, confirmed: 0 })
+  const alert = await oneAlert(server)
+  assert.equal((await server.get('/api/target?seeker=phone')).alert, null) // Radar live, nothing confirmed yet
+  await sleep(400)
+  const fallback = (await server.get('/api/target?seeker=phone')).alert
+  assert.equal(fallback.id, alert.id)
+  assert.equal(fallback.source, 'api')
+})
+
+test('confirming an unknown alert answers 404', async (t) => {
+  const server = await startServer(null)
+  t.after(() => server.stop())
+  const res = await server.call('POST', '/api/radar/alerts', { alertId: 'phone-1', radarEventId: 'uid-x', reason: 'HeroFound' })
+  assert.equal(res.status, 404)
+  assert.match(res.body.error, /no alert phone-1/)
+  assert.equal((await server.call('POST', '/api/radar/alerts', {})).status, 404)
+  assert.equal((await server.get('/api/integrations')).radar.confirmed, 0)
 })
