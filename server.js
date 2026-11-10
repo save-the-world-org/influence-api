@@ -16,9 +16,10 @@ const PROFILE_SECRET = process.env.PROFILE_SECRET || WRITE_KEY || randomBytes(32
 // Optional Elasticsearch: the registry is written through to it and search runs on it.
 const ES_URL = (process.env.ES_URL || '').replace(/\/$/, '')
 const ES_AUTH = process.env.ES_AUTH || '' // "ApiKey <base64>" or "Basic <base64>"
-// The Salt Palace Convention Center, Salt Lake City (the centre of OpenStreetMap's way 33149360): where the map
-// opens and the demo walks.
-const VENUE = { lat: 40.767437, lon: -111.8962966 }
+// Where the map opens and the demo walk circles: the team's coworking space since 2026-11-09 (the phone's GPS there),
+// for demos away from the venue. VENUE_LAT and VENUE_LON move it, for example back to the Salt Palace Convention
+// Center (40.767437, -111.8962966).
+const VENUE = { lat: Number(process.env.VENUE_LAT) || 40.760318, lon: Number(process.env.VENUE_LON) || -111.881187 }
 
 const state = {
   influencers: new Map(),
